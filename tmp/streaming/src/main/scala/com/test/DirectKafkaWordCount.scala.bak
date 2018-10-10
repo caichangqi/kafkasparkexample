@@ -1,0 +1,160 @@
+package com.test
+
+import org.apache.spark.streaming._
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.SaveMode
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.parquet.format.event.TypedConsumer.SetConsumer
+import org.apache.spark.streaming.kafka010._
+import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.sql.types._
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.sql.functions.from_json
+import spray.json._
+
+/**
+  * Consumes messages from one or more topics in Kafka and does wordcount.
+  * Usage: DirectKafkaWordCount <brokers> <topics>
+  *   <brokers> is a list of one or more Kafka brokers
+  *   <topics> is a list of one or more kafka topics to consume from
+  *
+  * Example:
+  *    $ bin/run-example streaming.DirectKafkaWordCount broker1-host:port,broker2-host:port \
+  *    topic1,topic2
+  */
+object DirectKafkaWordCount {
+
+  def convertSeqJsValue(jsValue: Seq[JsValue]): Any = {
+    jsValue match {
+      case Seq(JsString(jsValue)) => jsValue.toString
+      case Seq(JsNumber(jsValue)) => jsValue.toLong
+      case Seq(JsString("true")) => true
+      case Seq(JsString("false")) => false
+      case _ => DeserializationException("Only support string|double|boolean")
+    }
+  }
+
+  def main(args: Array[String]) {
+    if (args.length < 2) {
+      System.err.println(s"""
+                            |Usage: DirectKafkaWordCount <brokers> <topics>
+                            |  <brokers> is a list of one or more Kafka brokers
+                            |  <topics> is a list of one or more kafka topics to consume from
+                            |
+        """.stripMargin)
+      System.exit(1)
+    }
+
+    StreamingExamples.setStreamingLogLevels()
+
+    val Array(brokers, topics) = args
+
+    // Create context with 2 second batch interval
+    val sparkConf = new SparkConf().setAppName("DirectKafkaWordCount")
+    val ssc = new StreamingContext(sparkConf, Seconds(1))
+
+
+    // Create direct kafka stream with brokers and topics
+    val topicsSet = topics.split(",").toSet
+    val kafkaParams = Map[String, Object](
+      "bootstrap.servers" -> brokers,
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
+      "group.id" -> "use_a_separate_group_id_for_each_stream",
+      "auto.offset.reset" -> "latest",
+      "enable.auto.commit" -> (false: java.lang.Boolean)
+    )
+
+
+    val messages = KafkaUtils.createDirectStream[String, String](
+      ssc,
+      LocationStrategies.PreferConsistent,
+      ConsumerStrategies.Subscribe[String, String](topicsSet, kafkaParams))
+
+    val pairs = messages.map(_.value()).map( x => JsonParser(x).asJsObject()).map( json => {
+      val retCode = convertSeqJsValue((json.getFields("rcode"))).toString
+      val timeCost = convertSeqJsValue(json.getFields("timeCost")).asInstanceOf[Long]
+      (retCode, timeCost)
+    })
+
+//    val windowPairs = pairs.reduceByKeyAndWindow( (x,y) => x+y, windowDuration = Seconds(5), slideDuration = Seconds(1))
+    val windowPairs = pairs.reduceByKey( (x,y) => x+y)
+
+    windowPairs.print()
+
+    windowPairs.foreachRDD( (rdd, time) => {
+      rdd.foreach( row => {
+
+        val spark = SparkSession
+          .builder
+          .getOrCreate()
+
+        import spark.implicits._
+
+        val dfSeq = Seq(
+          (row._1, row._2)
+        )
+        val df = dfSeq.toDF("word", "count")
+
+        df.write
+          .mode(SaveMode.Append)
+          .format("jdbc")
+          .option("url", "jdbc:postgresql:192.168.56.100:5432/db_test_kafka_streaming")
+          .option("driver", "org.postgresql.Driver")
+          .option("dbtable", "t_word_count")
+          .option("user", "postgres")
+          .option("password", "000000")
+          .save()
+      })
+    })
+
+
+    /*
+    totalCost.foreachRDD(rdd => {
+      rdd.foreachPartition( partition => {
+        partition.foreach( record => {
+          val df = Seq(
+            (record._1, record._2)
+          ).toDF("word", "count")
+
+          df.write
+            .format("jdbc")
+            .option("url", "jdbc:postgresql:192.168.56.100:5432/db_test_kafka_streaming")
+            .option("driver", "org.postgresql.Driver")
+            .option("dbtable", "t_word_count")
+            .option("user", "postgres")
+            .option("password", "000000")
+            .mode(SaveMode.Append)
+            .save()
+        })
+      })
+    })
+
+    totalCost.print()
+    val pairs = messages.map( row => {
+      val jsonObj = JsonParser(row.value()).asJsObject()
+
+      val retCode = convertSeqJsValue(jsonObj.getFields("rcode")).toString
+      val timeCost = convertSeqJsValue(jsonObj.getFields("timeCost")).asInstanceOf[Long]
+      val msgNo = convertSeqJsValue(jsonObj.getFields("msgNo")).toString
+
+      (retCode, (1L, timeCost, msgNo, retCode))
+    })
+
+    val result = pairs.reduceByKey((x, y) => (x._1 + y._1, x._2 + y._2, x._3.concat("|").concat(y._3), x._4)).window(Seconds(5), Seconds(1))
+
+    result.print()
+
+
+    result.foreachRDD( rdd => {
+      val flatten =
+
+    })
+    */
+
+    // Start the computation
+    ssc.start()
+    ssc.awaitTermination()
+  }
+}
+// scalastyle:on println
